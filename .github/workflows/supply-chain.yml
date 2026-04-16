@@ -1,0 +1,84 @@
+name: Supply Chain Security Pipeline
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  sca-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t tp4-image:latest .
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: tp4-image:latest
+          format: cyclonedx-json
+          output-file: sbom.json
+
+      - name: Scan vulnerabilities with Grype
+        uses: anchore/scan-action@v3
+        with:
+          sbom: sbom.json
+          fail-build: false
+          severity-cutoff: critical
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.json
+
+  sign-and-attest:
+    needs: sca-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set lowercase repo name
+        id: repo
+        run: echo "name=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ steps.repo.outputs.name }}:${{ github.sha }}
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+
+      - name: Sign image (keyless OIDC)
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ steps.repo.outputs.name }}@${{ steps.build.outputs.digest }}
+
+      - name: Attest SBOM
+        run: |
+          cosign attest --yes \
+            --predicate sbom.json \
+            --type cyclonedx \
+            ghcr.io/${{ steps.repo.outputs.name }}@${{ steps.build.outputs.digest }}
